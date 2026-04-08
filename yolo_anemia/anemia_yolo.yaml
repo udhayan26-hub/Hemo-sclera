@@ -1,0 +1,5 @@
+path: C:\Users\udhay\OneDrive\Desktop\hemo-sclera\yolo_anemia
+train: images/train
+val: images/val
+names:
+  0: palpebral

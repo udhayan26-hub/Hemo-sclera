@@ -1,0 +1,2 @@
+An example picture from the Jaundice Eyes Detection dataset depicting a Jaundice
+An example picture from the Jaundice Eyes Detection dataset depicting a Normal
