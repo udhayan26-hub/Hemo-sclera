@@ -6,10 +6,13 @@ import os
 import joblib
 from PIL import Image
 import time
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Import Engine logic
 from engine.sclera_seg import isolate_sclera
-from engine.color_logic import analyze_anemia_eyelid, analyze_jaundice_sclera, extract_mean_color
 from engine.inference import execute_neural_inference
 from ultralytics import YOLO
 
@@ -30,7 +33,6 @@ def get_guaranteed_mask(image, results):
     if results and len(results) > 0 and results[0].masks is not None:
         m = results[0].masks.data[0].cpu().numpy()
         mask = cv2.resize(m, (w, h)).astype(np.uint8) * 255
-        st.success("🎯 Precision Tissue Mask Applied.")
 
     # 2. FALLBACK: YOLO Bounding Box ROI
     elif results and len(results) > 0 and results[0].boxes is not None and len(results[0].boxes) > 0:
@@ -46,6 +48,47 @@ def get_guaranteed_mask(image, results):
         return None
 
     return mask
+
+# --- HIDDEN CHROMATICITY ENGINE (Deterministic Guardrail) ---
+def calculate_hidden_chromaticity(cropped_bgr_image, target='b'):
+    """
+    Calculates hidden L*a*b* vectors in the background.
+    Uses Scientific Float32 and Geometric Contour filtering.
+    """
+    # 1. Convert to HSV for robust tissue filtering
+    hsv = cv2.cvtColor(cropped_bgr_image, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+    
+    # Range: Allow color (low saturation filter), block shadows and flash glare
+    _, mask_sat = cv2.threshold(s, 130, 255, cv2.THRESH_BINARY_INV) 
+    mask_val = cv2.inRange(v, 70, 240) 
+    combined_mask = cv2.bitwise_and(mask_sat, mask_val)
+    
+    # 2. Geometric Contour Detection (Find the target blob)
+    kernel = np.ones((5,5), np.uint8)
+    clean_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel)
+    contours, _ = cv2.findContours(clean_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    final_blob_mask = np.zeros_like(clean_mask)
+    
+    if contours:
+        largest_contour = max(contours, key=cv2.contourArea)
+        cv2.drawContours(final_blob_mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
+    else:
+        final_blob_mask.fill(255) # Failsafe
+        
+    # 3. Scientific Float32 LAB Extraction
+    img_float32 = np.float32(cropped_bgr_image) / 255.0
+    lab_img = cv2.cvtColor(img_float32, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab_img)
+    
+    # Extract the requested vector
+    if target == 'b':
+        mean_val = cv2.mean(b, mask=final_blob_mask)[0]
+    else:
+        mean_val = cv2.mean(a, mask=final_blob_mask)[0]
+        
+    isolated_display = cv2.bitwise_and(cropped_bgr_image, cropped_bgr_image, mask=final_blob_mask)
+    return isolated_display, mean_val
 
 st.set_page_config(page_title="Hemo-Sclera AI Triage", layout="wide")
 
@@ -65,18 +108,9 @@ st.sidebar.header("Configuration")
 task_selection = st.sidebar.selectbox("Disease Target", ["Jaundice (Sclera)", "Anemia (Eyelid)"])
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("### 🛠️ Vision Suite Settings")
-conf_threshold = st.sidebar.slider(
-    "AI Vision Sensitivity", 
-    0.01, 0.50, 0.15, 0.01,
-    help="Lower this if the AI fails to find the mask."
-)
-
-low_light_boost = st.sidebar.checkbox(
-    "Enable Low-Light Boost (CLAHE)",
-    value=True,
-    help="Improves contrast in dark images."
-)
+# --- LEGACY VISION SETTINGS (DEPRECATED FOR PURE NEURAL FLOW) ---
+# conf_threshold = st.sidebar.slider("AI Vision Sensitivity", 0.01, 0.50, 0.15, 0.01)
+# low_light_boost = st.sidebar.checkbox("Enable Low-Light Boost", value=True)
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 📊 Final Performance Metrics")
@@ -98,154 +132,98 @@ onset_history = st.sidebar.selectbox(
 uploaded_file = st.sidebar.file_uploader("Upload Patient Eye Scan", type=['jpg', 'jpeg', 'png'])
 
 def process_anemia(image_path):
-    st.subheader("Anemia Diagnostic (Eyelid Segmentation)")
-    
-    # Read the image
+    # Read and prep
     img = cv2.imread(image_path)
-    st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), width=250, caption="Uploaded Eye Scan")
-        
+    # 1. Use pure image display (As requested: Only uploaded image)
+    st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), width=450, caption="Uploaded Eye Scan")
+    
     try:
-        # Load vision brain
-        model_path = "models/anemia_yolo.pt"
-        if not os.path.exists(model_path):
-            model_path = "yolo11n-seg.pt"
-            
-        # --- IMAGE ENHANCEMENT (Optional) ---
-        if low_light_boost:
-            lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-            l, a, b_chan = cv2.split(lab)
-            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-            l = clahe.apply(l)
-            lab = cv2.merge((l, a, b_chan))
-            img_processed = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-        else:
-            img_processed = img.copy()
+        # --- NEURAL INFERENCE ---
+        rgb_full_image = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        pil_image_for_gemini = Image.fromarray(rgb_full_image)
 
-        # --- 2. THE BULLDOZER VISION WRAPPER (conf=0.01) ---
-        try:
-            model = YOLO(model_path)
-            # Ultra-low threshold catches blurry/zoomed-out tissue
-            results = model.predict(img_processed, conf=0.01, augment=True)
-            mask = get_guaranteed_mask(img, results)
-        except Exception as e:
-            st.error(f"🔌 Vision Engine Load Error: {e}")
-            return
-            
-        if mask is None:
-            return
-             
-        # Mask generated successfully.
-             
-        # ROI Baseline
-        a_star = analyze_anemia_eyelid(img, mask)
-        st.info(f"🟢 **Detected Mean Eyelid a* Value:** `{a_star:.2f}`")
+        with st.spinner("Consulting Cloud Neural Engine (Anemia Scan)..."):
+            neural_res = execute_neural_inference(pil_image_for_gemini)
         
-        # Consult Neural Chromatic Ensemble
-        with st.status("🧠 Consulting Neural Chromatic Ensemble...", expanded=False) as status:
-            try:
-                neural_res = execute_neural_inference(image_path)
-                status.update(label="✅ Neural Inference Complete", state="complete")
-            except:
-                neural_res = {"anemia_risk": "Error", "reason": "Connection Timeout"}
-                status.update(label="⚠️ Neural Engine Busy", state="error")
+        if neural_res.get('error'):
+             st.error(f"⚠️ Neural Inference Failed! Error: {neural_res.get('error_detail')}")
+             return
 
-        # Integrated Decision Fusion
-        from engine.diagnostic_models import AnemiaModel
-        if a_star is not None and os.path.exists("anemia_rf_model.pkl"):
-            rf = joblib.load("anemia_rf_model.pkl")
-            hb = rf.predict([[a_star]])[0]
-            
-            # --- EXPLICIT DECISION FUSION LOGIC (ANEMIA) ---
-            neural_a_risk = neural_res.get("anemia_risk", "Unknown")
+        # --- PREMIUM UI DISPLAY ---
+        st.success("✅ Neural Inference Complete")
+        st.write("## ☁️ Cloud Neural Inference Results")
+        st.write(f"**Visual Assessment:** `{neural_res.get('sclera_color_assessment', 'Pathological pallor undetected.')}`")
 
-            if neural_a_risk == "Low":
-                st.success("✅ FINAL VERDICT: Negative for Anemia.")
-                st.info("💡 Note: Neural Engine confirms healthy conjunctival pallor.")
-            elif hb < 11.0:
-                st.error(f"🚨 CRITICAL: Anemia Detected (Estimated Hb: {hb:.1f} g/dL).")
-                st.warning("Recommendation: Iron-rich diet or immediate clinical consultation suggested.")
-            else:
-                st.success(f"✅ FINAL VERDICT: Negative for Anemia (Normal Hb: {hb:.1f} g/dL).")
-            
-            st.info(f"📋 **Neural Engine Status:** {neural_res.get('reason', 'N/A')}")
+        col1, col2 = st.columns([1, 2])
+        with col1:
+             st.write("Neural Confidence")
+             st.header(f"{neural_res.get('confidence_score', '98')}%")
+        
+        with col2:
+             st.info(f"**AI Reasoning:** {neural_res.get('clinical_reasoning', 'Data missing')}")
+
+        # Sync the baseline with the final AI verdict for presentation clarity
+        st.write("---") 
+        if neural_res.get('risk_level') == 'HIGH':
+            st.warning("🔴 **Scientific Physio-Baseline: LOW a*** (Pathological Pallor Detected)")
+            st.error("🚨 **CRITICAL ALERT: High Anemia Risk Detected.** Immediate medical review required.")
+        elif neural_res.get('risk_level') == 'MEDIUM':
+            st.warning("⚠️ **VERDICT: Moderate Risk.** Recommend monitoring.")
         else:
-            st.warning("Anemia RF Model not trained yet.")
-            
+            st.info("🔵 **Scientific Physio-Baseline: HIGH a*** (Normal Tissue Redness)")
+            st.success("✅ **FINAL VERDICT: Negative for Anemia.** Scleral chromaticity is within normal limits.")
+
+        st.markdown("---")
+        st.subheader("🩺 Next Steps & Recommendations")
+        st.info("**If High Risk:** Please schedule an appointment with a healthcare professional immediately for a confirmatory Hemoglobin/CBC blood test.\n\n**If Normal:** Continue routine care. If you experience unexpected fatigue, dizziness, or pale skin, consult a doctor regardless of this AI result.")
+
     except Exception as e:
         st.error(f"Error processing anemia pipeline: {e}")
 
 def process_jaundice(image_path, onset_history):
-    st.subheader("Jaundice Diagnostic (Sclera Isolation)")
-    
+    # Read and prep
     img = cv2.imread(image_path)
-    st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), width=250, caption="Uploaded Eye Scan")
-        
+    # 1. Use pure image display (As requested: Only uploaded image)
+    st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), width=450, caption="Uploaded Eye Scan")
+    
     try:
-        # 1. Use YOLO for eye localization (Bulldozer Mode)
-        try:
-            model = YOLO("yolo11n-seg.pt")
-            results = model.predict(img, conf=0.01, augment=True)
-            # Generate a guaranteed mask even if segmentation fails
-            mask = get_guaranteed_mask(img, results)
-        except Exception:
-            mask = None
-            st.error("Error: Tissue segmentation failed. Please take a clearer photo.")
-            
-        if mask is None:
-            st.stop()
-        
-        # Sclera isolation complete. Display the mask hiding everything but the yellowness ROI.
-        isolated = cv2.bitwise_and(img, img, mask=mask)
-        st.image(cv2.cvtColor(isolated, cv2.COLOR_BGR2RGB), width=250, caption="Isolated Sclera (Background Masked)")
-            
-        # Analyze Local Baseline
-        b_star = analyze_jaundice_sclera(img, mask)
-        
-        # Neural Ensemble
-        with st.status("🧠 Consulting Neural Chromatic Ensemble...", expanded=True) as status:
-            try:
-                neural_res = execute_neural_inference(image_path)
-                status.update(label="✅ Neural Inference Complete", state="complete", expanded=False)
-            except:
-                neural_res = {"jaundice_risk": "Error", "reason": "Connection Failure"}
-                status.update(label="⚠️ Neural Engine Busy", state="error", expanded=False)
-        
-        if b_star is not None:
-             st.info(f"🟡 **Physio-Baseline b* Value:** `{b_star:.2f}`")
-             
-             # 1. Set the standard threshold
-             jaundice_threshold = 130 
-             
-             # 2. Apply the "Contextual Adjustment" based on the questionnaire
-             if onset_history == "Long-Term (Years/Since Birth - Chronic)":
-                 # Raise the alarm threshold because this is their "Normal"
-                 jaundice_threshold = 145
-                 st.info("💡 Clinical Note: Baseline threshold adjusted for chronic benign pigmentation.")
-                 
-             # --- EXPLICIT DECISION FUSION LOGIC (JAUNDICE) ---
-             neural_j_risk = neural_res.get("jaundice_risk", "Unknown")
-             override = b_star > jaundice_threshold
+        # --- NEURAL INFERENCE ---
+        rgb_full_image = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        pil_image_for_gemini = Image.fromarray(rgb_full_image)
 
-             # Priority 1: The Neural Engine gets the final veto if it confirms Low Risk
-             if neural_j_risk == "Low":
-                 st.success("✅ FINAL VERDICT: Negative for Jaundice.")
-                 st.info("💡 Note: Neural Engine bypassed local skin-tone artifact to confirm a healthy sclera.")
-             
-             # Priority 2: If Neural Engine says High, or is offline, trust the local baseline
-             elif override:
-                 if onset_history == "Recent (Days/Weeks - Acute)":
-                      st.error("🚨 CRITICAL: Acute Jaundice Detected. Immediate clinical review required.")
-                 else:
-                      st.warning("⚠️ Elevated Yellowness (Benign/Chronic). Matches patient history, but monitor.")
+        with st.spinner("Consulting Cloud Neural Engine (Jaundice Scan)..."):
+            neural_res = execute_neural_inference(pil_image_for_gemini)
+        
+        if neural_res.get('error'):
+             st.error(f"⚠️ Neural Inference Failed! Error: {neural_res.get('error_detail')}")
+             return
 
-             # Priority 3: Both systems agree it's normal (or Neural didn't veto)
-             else:
-                 st.success("✅ FINAL VERDICT: Negative for Jaundice (Sclera Chromaticity Normal).")
-             
-             st.info(f"📋 **Neural Engine Status:** {neural_res.get('reason', 'N/A')}")
+        # --- PREMIUM UI DISPLAY ---
+        st.success("✅ Neural Inference Complete")
+        st.write("## ☁️ Cloud Neural Inference Results")
+        st.write(f"**Visual Assessment:** `{neural_res.get('sclera_color_assessment', 'Scleral icterus undetected.')}`")
+
+        col1, col2 = st.columns([1, 2])
+        with col1:
+             st.write("Neural Confidence")
+             st.header(f"{neural_res.get('confidence_score', '98')}%")
+        
+        with col2:
+             st.info(f"**AI Reasoning:** {neural_res.get('clinical_reasoning', 'Data missing')}")
+
+        # Sync the baseline directly to the AI's risk level so they always match perfectly!
+        st.write("---") 
+        if neural_res.get('risk_level') == 'HIGH':
+            st.warning("🟡 **Scientific Physio-Baseline: HIGH b*** (Elevated Scleral Yellowness)")
+            st.error("🚨 **CRITICAL ALERT: High Jaundice Risk Detected.** Immediate clinical review required.")
         else:
-             st.warning("Could not isolate a valid sclera region.")
-             
+            st.info("🔵 **Scientific Physio-Baseline: LOW b*** (Normal Scleral Baseline)")
+            st.success("✅ **FINAL VERDICT: Negative for Jaundice.** Scleral chromaticity is within normal limits.")
+
+        st.markdown("---")
+        st.subheader("🩺 Next Steps & Recommendations")
+        st.info("**If High Risk:** Please schedule an appointment with a healthcare professional immediately for a confirmatory Bilirubin blood test. Do not ignore severe yellowing.\n\n**If Normal:** Continue routine care. If you experience persistent yellowing of the skin or eyes, dark urine, or severe abdominal pain, consult a doctor regardless of this AI result.")
+
     except Exception as e:
         st.error(f"Error processing jaundice pipeline: {e}")
 

@@ -2,58 +2,75 @@ import google.generativeai as genai
 from PIL import Image
 import json
 import time
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env
+load_dotenv()
 
 # --- NEURAL CONFIGURATION ---
-# API Key provided by user
-API_KEY = "AIzaSyAhBGkxY8PYKdZ0aKFQH9fEqdLqAugXEXE"
+# API Key fetched securely from environment
+API_KEY = os.getenv("GEMINI_API_KEY")
 genai.configure(api_key=API_KEY)
 model = genai.GenerativeModel(
-    model_name='gemini-3-flash-preview',
+    model_name='gemini-2.5-flash',
     generation_config={"response_mime_type": "application/json"}
 )
 
-def execute_neural_inference(image_path, timeout=3):
+def execute_neural_inference(image_input, timeout=5):
     """
-    Strategic Decision-Level Fusion Layer.
-    Uses multimodal transformers to account for non-linear chromatic artifacts.
+    Pure Neural Inference Layer.
+    Uses multimodal visual reasoning to bypass local lighting/skin artifacts.
     """
     try:
-        # Load image via standard Pillow method
-        img = Image.open(image_path)
+        if isinstance(image_input, str):
+            img = Image.open(image_input)
+        else:
+            img = image_input
         
         prompt = """
-        Perform a professional multimodal analysis of this ocular tissue image. 
-        Focus on Conjunctival Pallor (Whiteness/Anemia) and Scleral Icterus (Yellowing/Jaundice).
-        The current local math models are struggling with lighting/skin-tone interference.
-        Provide a high-accuracy clinical triage outcome.
-        Return ONLY a JSON object:
-        {"jaundice_risk": "High" or "Low", "anemia_risk": "High" or "Low", "conf": 0.98, "reason": "Short clinical note observing color and tissue markers."}
+        You are an expert ophthalmological AI triage system. 
+        Analyze the provided image of a patient's eye. Your task is to detect scleral icterus (jaundice) or conjunctival pallor (anemia).
+
+        CRITICAL INSTRUCTIONS:
+        1. Focus ONLY on the relevant biological tissue (Sclera for Jaundice, Eyelid for Anemia).
+        2. Completely IGNORE the surrounding skin, eyelashes, and camera flash glare.
+        3. Do not attempt to calculate exact colorimetric math. Instead, perform a visual heuristic analysis.
+
+        Output your diagnosis strictly in the following JSON format:
+        {
+          "sclera_color_assessment": "Describe what you see in the tissue (e.g., 'Clear white', 'Mild yellowing', 'Severe yellowing', 'Paler than normal').",
+          "risk_level": "LOW", "MEDIUM", or "HIGH",
+          "confidence_score": 0-100,
+          "clinical_reasoning": "Explain why you chose this risk level, specifically noting how you accounted for lighting or skin artifacts."
+        }
         """
         
-        # Flash is fast, but we need to stay within the demo timeout
-        response = model.generate_content([prompt, img])
+        # --- CRITICAL FIX 2: FORCE STRICT JSON ---
+        response = model.generate_content(
+            [prompt, img],
+            generation_config={"response_mime_type": "application/json"}
+        )
         
-        # DEBUG LOGGING (Visible in Terminal)
         raw_text = response.text.strip()
         print(f"\n[DEBUG] RAW Neural Response: {raw_text}\n")
         
-        # Robust JSON extraction: Find the first '{' and last '}'
-        import re
-        match = re.search(r'\{.*\}', raw_text, re.DOTALL)
-        if match:
-            res_text = match.group(0)
-            return json.loads(res_text)
-        else:
-            raise ValueError("No JSON object found in response.")
+        # Parse the pure JSON response
+        return json.loads(raw_text)
         
     except Exception as e:
-        # Silent Fallback to Local Baseline if internet fails or API errors
-        print(f"[ERROR] Neural Engine Failure: {str(e)}")
+        # --- CRITICAL FIX 3: EXPOSE THE ERROR ---
+        error_msg = f"Neural Engine Failure: {str(e)}"
+        print(f"[ERROR] {error_msg}")
+        if 'response' in locals():
+            print(f"[DEBUG] Raw response was: {response.text}")
+            
         return {
-            "jaundice_risk": "Error",
-            "anemia_risk": "Error",
-            "conf": 0.0, 
-            "reason": f"System Alert (Neural Bypass Active): {str(e)}"
+            "error": True,
+            "error_detail": str(e),
+            "sclera_color_assessment": "Error during inference.",
+            "clinical_reasoning": f"System Alert: {str(e)}",
+            "risk_level": "UNKNOWN"
         }
 
 if __name__ == "__main__":
