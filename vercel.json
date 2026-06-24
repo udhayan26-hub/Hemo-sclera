@@ -1,8 +1,5 @@
 {
   "framework": "nextjs",
   "buildCommand": "next build",
-  "outputDirectory": ".next",
-  "env": {
-    "OPENROUTER_API_KEY": "@openrouter_api_key"
-  }
+  "outputDirectory": ".next"
 }
