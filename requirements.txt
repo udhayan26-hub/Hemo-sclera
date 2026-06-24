@@ -3,7 +3,7 @@ opencv-python-headless
 numpy
 joblib
 ultralytics
-google-generativeai
 python-dotenv
 pillow
 scikit-learn
+openai

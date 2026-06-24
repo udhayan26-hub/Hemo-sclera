@@ -1,0 +1,12 @@
+[run]
+branch = True
+source = engine
+
+[report]
+show_missing = True
+exclude_lines =
+    pragma: no cover
+    def __repr__
+    if __name__ == .__main__.:
+    raise AssertionError
+    raise NotImplementedError
