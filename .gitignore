@@ -1,10 +1,16 @@
+# Python
 __pycache__/
 *.pyc
 .venv/
 venv/
-.env
 .ipynb_checkpoints/
 *.log
 .DS_Store
+
+# Secrets
 .env
 
+# Next.js
+node_modules/
+.next/
+out/
